@@ -1,0 +1,79 @@
+faiss是操作向量数据库的工具；主要是检索：
+
+！！流程：1获得向量数据.2构建索引。3进行检索
+！！已有的构建索引方法：
+        IndexFlatL2 - 最基础的Index检索
+        Flat ：暴力检索
+        IVFx Flat ：倒排暴力检索
+        PQx ：乘积量化
+        IVFxPQy 倒排乘积量化
+        LSH 局部敏感哈希
+        HNSWx ：层次NSW【图检索】
+!!注意：
+    1Faiss所有的index仅支持浮点数为float32格式：
+        Faiss仅支持浮点数为np.float32格式，其余一律不支持，所以用Faiss前需要将向量数据转化为float32，否则会报错！这也告诉大家，想用降低精度来实现降低index内存占用是不可能的！
+    2关于HNSW：
+        HNSW虽好，可不要贪杯哦，这里坑还是蛮多的：
+            HNSW的构建过程有时很短，有时却又很长，500万量级的向量快时可以15分钟构建完毕，慢则有可能花费两小时，这和HNSW构建多层图结构时的生成函数有关。
+            老版本faiss的HNSW在使用以下这种构建索引方式时，有一个bug，这个bug会导致如果measure选用内积的方法度量，但最后构建的索引的度量方式仍然是欧氏距离：
+                index = faiss.index_factory(dim, param, measure)
+            如果想构建以内积（余弦相似度）为基准的HNSW索引，可以这样构建：
+                index = faiss.IndexHNSWFlat(dim, x,measure)  # measure 选为内积，x为4~64之间的整数
+            所以直接建议使用新版本faiss，版本最好 > 1.7，无此bug。
+            HNSW占用内存真的很大，500万条768维的向量构建的索引占用内存17G，而同样数据下LSH仅占用500M，emmm所以自行体会吧。
+            HNSW的检索候选可能不会很多，笔者的经验是一般500w的候选集，用HNSW64构建索引，检索top1000的时候就开始出现尾部重复现象，这其实就是HNSW在他的构建图中搜索不到近邻向量了，所以最后会用一个重复的id将尾部padding，让输出list补满至1000个，虽然IVF、PQ都会出现这个问题，但是HNSW会特别明显，这个和算法本身的原理有关
+    3如果我们的需求，既想PCA降维减小index占用内存，还想分批add向量，该怎么办？：
+        可以使用sklean中的增量pca方法，先把数据降维成低维的，再将降维后的向量分批add进索引中，增量pca使用方法和pca一致：
+            from sklearn.decomposition import IncrementalPCA
+    4 Faiss在构建索引时，有时生成的vecs会很大，向index中添加的向量很有可能无法一次性放入内存中，怎么办呢？：
+        这时候，索引的可分批导入index的性质就起了大作用了；
+        如何来知道一种index是否可以分批add呢？一般来说在未对index进行train操作前，如果一个index.is_trained = True，那么它就是可以分批add的；
+        如果是index.is_trained = False，就不能分批导入，当然，其实强行对index.is_trained = False的索引分批add向量是不会报错的，只不过内部构建索引的逻辑和模型都在第一个batch数据的基础上构建的，比如PCA降维，其实是拿第一个batch训练了一个PCA模型，后续add进入的新向量都用这个模型降维，这样会导致后续batch的向量失真，影响精度，当然如果不在意这点精度损失那也可以直接add；
+        由上可得，只要一个index的param中包含PCA，那他就不能分批add；
+        可以分批导入的index为：HNSW、Flat、LSH。
+    5Faiss可以组合传参：
+        Faiss内部支持先将向量PCA降维后再构建index，param设置如下：
+            param = 'PCA32,IVF100,PQ16'
+        代表将向量先降维成32维，再用IVF100 PQ16的方法构建索引。
+        同理可以使用：
+            param = 'PCA32,HNSW32'
+        可以用来处理HNSW内存占用过大的问题。
+
+！！进行检索的方式：
+    k = 4  # topK的K值
+    D, I = index.search(xq, k)  # xq为待检索向量，返回的I为每个待检索query最相似TopK的索引list，D为其对应的距离。index为构建完索引检所的向量数据
+    print(I[:5])
+    print(D[-5:])
+
+！！构建索引方式：
+1：
+IndexFlatL2 - 最基础的Index
+	IndexFlatL2索引的结果是精确的,可以用来作为其他索引测试中准确性程度的参考.
+
+2：
+更快的搜索 - IndexIVFFlat    【倒排暴力检索】
+        为了加快搜索速度，可以将数据集分割成几部分。我们在d维空间中定义Voronoi单元格，并且每个数据库矢量都落入其中一个单元格中。在搜索时，只有查询x所在单元中包含的数据库向量y与少数几个相邻查询向量进行比较。(划分搜索空间)
+        这种类型的索引需要一个训练的过程，可以在与数据库向量具有相同分布的任何向量集合上执行。
+        这IndexIVFFlat还需要另一个索引，即量化器(quantizer)，它将矢量分配给Voronoi单元。每个单元由一个质心定义，找到一个矢量所在的Voronoi单元包括在质心集中找到该矢量的最近邻居。这是另一个索引的任务，通常是索引IndexFlatL2。
+    搜索方法有两个参数：
+    nlist 划分单元的数量
+    nprobe 执行搜索访问的单元格数(不包括nlist)
+    nprobe 参数始终是调整结果速度和准确度之间折中的一种方式 。设置 nprobe = nlist 将给出与蛮力搜索（但会更慢）相同的结果。
+
+3：
+更低的内存占用 - IndexIVFPQ
+	索引IndexFlatL2和IndexIVFFlat都存储完整的向量。 为了扩展到非常大的数据集，Faiss提供了基于产品量化器的有损压缩来压缩存储的向量的变体。压缩的方法基于乘积量化(Product Quantizer)。
+在这种情况下，由于矢量没有精确存储，搜索方法返回的距离也是近似值。
+
+
+
+！！创建一个向量数据示例的程序：
+    import numpy as np
+    d = 64                                           # 向量维度
+    nb = 100000                                      # index向量库的数据量
+    nq = 10000                                       # 待检索query的数目
+    np.random.seed(1234)
+    xb = np.random.random((nb, d)).astype('float32')
+    xb[:, 0] += np.arange(nb) / 1000.                # index向量库的向量
+    xq = np.random.random((nq, d)).astype('float32')
+    xq[:, 0] += np.arange(nq) / 1000.                # 待检索的query向量
